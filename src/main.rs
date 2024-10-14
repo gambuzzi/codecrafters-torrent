@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json;
 use std::env;
 use std::fs;
@@ -5,6 +6,21 @@ use std::fs;
 // Available if you need it!
 use serde_bencode;
 use serde_bencode::value::Value;
+
+#[derive(Deserialize)]
+pub struct TorrentInfo {
+    length: usize,
+    pub name: String,
+    #[serde(rename = "piece length")]
+    pub piece_length: usize,
+    // pub pieces: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct Metainfo {
+    announce: String,
+    info: TorrentInfo,
+}
 
 fn map_bencode_to_json(value: Value) -> serde_json::Value {
     match value {
@@ -36,9 +52,8 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     map_bencode_to_json(val)
 }
 
-fn decode_bencoded_value_u8(encoded_value: &[u8]) -> serde_json::Value {
-    let val: Value = serde_bencode::from_bytes(encoded_value).unwrap();
-    map_bencode_to_json(val)
+fn decode_bencoded_metainfo(encoded_value: &[u8]) -> Metainfo {
+    serde_bencode::from_bytes(encoded_value).unwrap()
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
@@ -53,24 +68,9 @@ fn main() {
     } else if command == "info" {
         let filename = &args[2];
         let content = fs::read(filename).expect("Cannot read the file.");
-        let decoded_info = decode_bencoded_value_u8(&content);
-        let url = decoded_info
-            .as_object()
-            .unwrap()
-            .get("announce")
-            .unwrap()
-            .as_str()
-            .unwrap();
-        let length = decoded_info
-            .as_object()
-            .unwrap()
-            .get("info")
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .get("length")
-            .unwrap()
-            .to_string();
+        let decoded_info = decode_bencoded_metainfo(&content);
+        let url = decoded_info.announce;
+        let length = decoded_info.info.length;
 
         println!("Tracker URL: {}\nLength: {}", url, length);
     } else {
