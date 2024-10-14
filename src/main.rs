@@ -1,22 +1,23 @@
-use serde::Deserialize;
+use hex::ToHex;
+use serde::{Deserialize, Serialize};
 use serde_json;
+use sha1::{Digest, Sha1};
 use std::env;
 use std::fs;
-
 // Available if you need it!
 use serde_bencode;
 use serde_bencode::value::Value;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TorrentInfo {
     length: usize,
     pub name: String,
     #[serde(rename = "piece length")]
     pub piece_length: usize,
-    // pub pieces: Vec<Value>,
+    pub pieces: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Metainfo {
     announce: String,
     info: TorrentInfo,
@@ -69,10 +70,21 @@ fn main() {
         let filename = &args[2];
         let content = fs::read(filename).expect("Cannot read the file.");
         let decoded_info = decode_bencoded_metainfo(&content);
+        // dbg!(&decoded_info);
         let url = decoded_info.announce;
         let length = decoded_info.info.length;
+        let serialize_info =
+            serde_bencode::to_bytes(&decoded_info.info).expect("problems with re-serialization");
+        let mut hasher = Sha1::new();
+        hasher.update(&serialize_info);
+        let hash_value = hasher.finalize();
 
-        println!("Tracker URL: {}\nLength: {}", url, length);
+        println!(
+            "Tracker URL: {}\nLength: {}\nInfo Hash: {}",
+            url,
+            length,
+            hash_value.encode_hex::<String>()
+        );
     } else {
         println!("unknown command: {}", args[1])
     }
