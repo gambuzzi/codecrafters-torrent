@@ -17,6 +17,15 @@ pub struct TorrentInfo {
     pub pieces: Value,
 }
 
+impl TorrentInfo {
+    fn compute_hexsha1(&self) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(&serde_bencode::to_bytes(self).expect("problems with re-serialization"));
+        let hash_value = hasher.finalize();
+        hash_value.encode_hex::<String>()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Metainfo {
     announce: String,
@@ -73,17 +82,11 @@ fn main() {
         // dbg!(&decoded_info);
         let url = decoded_info.announce;
         let length = decoded_info.info.length;
-        let serialize_info =
-            serde_bencode::to_bytes(&decoded_info.info).expect("problems with re-serialization");
-        let mut hasher = Sha1::new();
-        hasher.update(&serialize_info);
-        let hash_value = hasher.finalize();
+        let hash_value = decoded_info.info.compute_hexsha1();
 
         println!(
             "Tracker URL: {}\nLength: {}\nInfo Hash: {}",
-            url,
-            length,
-            hash_value.encode_hex::<String>()
+            url, length, hash_value
         );
     } else {
         println!("unknown command: {}", args[1])
