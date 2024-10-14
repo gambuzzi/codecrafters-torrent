@@ -29,6 +29,12 @@ fn map_bencode_to_json(value: Value) -> serde_json::Value {
     }
 }
 
+#[allow(dead_code)]
+fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
+    let val: Value = serde_bencode::from_str(encoded_value).unwrap();
+    map_bencode_to_json(val)
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 fn main() {
     let args: Vec<String> = env::args().collect();
