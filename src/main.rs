@@ -1,5 +1,6 @@
 use serde_json;
 use std::env;
+use std::fs;
 
 // Available if you need it!
 use serde_bencode;
@@ -35,6 +36,11 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     map_bencode_to_json(val)
 }
 
+fn decode_bencoded_value_u8(encoded_value: &[u8]) -> serde_json::Value {
+    let val: Value = serde_bencode::from_bytes(encoded_value).unwrap();
+    map_bencode_to_json(val)
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -44,6 +50,29 @@ fn main() {
         let encoded_value = &args[2];
         let decoded_value = decode_bencoded_value(encoded_value);
         println!("{}", decoded_value.to_string());
+    } else if command == "info" {
+        let filename = &args[2];
+        let content = fs::read(filename).expect("Cannot read the file.");
+        let decoded_info = decode_bencoded_value_u8(&content);
+        let url = decoded_info
+            .as_object()
+            .unwrap()
+            .get("announce")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let length = decoded_info
+            .as_object()
+            .unwrap()
+            .get("info")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("length")
+            .unwrap()
+            .to_string();
+
+        println!("Tracker URL: {}\nLength: {}", url, length);
     } else {
         println!("unknown command: {}", args[1])
     }
