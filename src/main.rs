@@ -24,6 +24,13 @@ impl TorrentInfo {
         let hash_value = hasher.finalize();
         hash_value.encode_hex::<String>()
     }
+
+    fn get_pieces(&self) -> Vec<[u8; 20]> {
+        match self.pieces {
+            Value::Bytes(ref bytes) => bytes.chunks(20).map(|x| x.try_into().unwrap()).collect(),
+            _ => vec![],
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,11 +90,23 @@ fn main() {
         let url = decoded_info.announce;
         let length = decoded_info.info.length;
         let hash_value = decoded_info.info.compute_hexsha1();
+        let piece_length = decoded_info.info.piece_length;
 
         println!(
-            "Tracker URL: {}\nLength: {}\nInfo Hash: {}",
-            url, length, hash_value
+            "Tracker URL: {}\nLength: {}\nInfo Hash: {}\nPiece Length: {}\nPiece Hashes:",
+            url, length, hash_value, piece_length
         );
+
+        println!(
+            "{}",
+            decoded_info
+                .info
+                .get_pieces()
+                .iter()
+                .map(|piece| piece.encode_hex())
+                .collect::<Vec<String>>()
+                .join("\n")
+        )
     } else {
         println!("unknown command: {}", args[1])
     }
