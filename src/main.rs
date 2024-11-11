@@ -1,14 +1,36 @@
+use clap::{Parser, Subcommand};
 use hex::ToHex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
-use std::env;
+use std::error::Error;
 use std::fs;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 // Available if you need it!
 use serde_bencode;
 use serde_bencode::value::Value;
+
+const PEER_ID: &str = "12345678901234567890";
+
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+#[clap(rename_all = "snake_case")]
+enum Command {
+    Decode { encoded_value: String },
+    Info { torrent_file: String },
+    Peers { torrent_file: String },
+    Handshake { torrent_file: String, peer: Peer },
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TorrentInfo {
@@ -51,10 +73,30 @@ impl TorrentInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Peer {
     pub host: Ipv4Addr,
     pub port: u16,
+}
+
+impl Peer {
+    fn as_tuple(&self) -> (Ipv4Addr, u16) {
+        (self.host, self.port)
+    }
+}
+
+impl FromStr for Peer {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, port) = s
+            .split_once(':')
+            .ok_or("Invalid peer address format".to_string())?;
+        Ok(Peer {
+            host: Ipv4Addr::from_str(host).map_err(|_| "Invalid peer host".to_string())?,
+            port: port.parse().map_err(|_| "Invalid peer port".to_string())?,
+        })
+    }
 }
 
 impl TrackerResponse {
@@ -112,85 +154,115 @@ fn decode_bencoded_metainfo(encoded_value: &[u8]) -> Metainfo {
     serde_bencode::from_bytes(encoded_value).unwrap()
 }
 
+fn compute_info_hash(torrent_file: String) -> Vec<u8> {
+    let content = fs::read(torrent_file).expect("Cannot read the file.");
+    let decoded_info = decode_bencoded_metainfo(&content);
+    decoded_info.info.compute_hexsha1_binary()
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 #[tokio::main]
-async fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    match args.command {
+        Command::Decode { encoded_value } => {
+            let decoded_value = decode_bencoded_value(encoded_value.as_str());
+            println!("{}", decoded_value.to_string());
+            Ok(())
+        }
+        Command::Info { torrent_file } => {
+            let content = fs::read(torrent_file).expect("Cannot read the file.");
+            let decoded_info = decode_bencoded_metainfo(&content);
+            // dbg!(&decoded_info);
+            let url = decoded_info.announce;
+            let length = decoded_info.info.length;
+            let hash_value = decoded_info.info.compute_hexsha1();
+            let piece_length = decoded_info.info.piece_length;
 
-    if command == "decode" {
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value.to_string());
-    } else if command == "info" {
-        let filename = &args[2];
-        let content = fs::read(filename).expect("Cannot read the file.");
-        let decoded_info = decode_bencoded_metainfo(&content);
-        // dbg!(&decoded_info);
-        let url = decoded_info.announce;
-        let length = decoded_info.info.length;
-        let hash_value = decoded_info.info.compute_hexsha1();
-        let piece_length = decoded_info.info.piece_length;
+            println!(
+                "Tracker URL: {}\nLength: {}\nInfo Hash: {}\nPiece Length: {}\nPiece Hashes:",
+                url, length, hash_value, piece_length
+            );
 
-        println!(
-            "Tracker URL: {}\nLength: {}\nInfo Hash: {}\nPiece Length: {}\nPiece Hashes:",
-            url, length, hash_value, piece_length
-        );
+            println!(
+                "{}",
+                decoded_info
+                    .info
+                    .get_pieces()
+                    .iter()
+                    .map(|piece| piece.encode_hex())
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            );
+            Ok(())
+        }
+        Command::Peers { torrent_file } => {
+            let content = fs::read(torrent_file).expect("Cannot read the file.");
+            let decoded_info = decode_bencoded_metainfo(&content);
 
-        println!(
-            "{}",
-            decoded_info
-                .info
-                .get_pieces()
-                .iter()
-                .map(|piece| piece.encode_hex())
-                .collect::<Vec<String>>()
-                .join("\n")
-        )
-    } else if command == "peers" {
-        let filename = &args[2];
-        let content = fs::read(filename).expect("Cannot read the file.");
-        let decoded_info = decode_bencoded_metainfo(&content);
+            let url = decoded_info.announce;
+            let mut reqwest_url = reqwest::Url::parse(&url).unwrap();
+            let info_hash = decoded_info.info.compute_hexsha1_binary();
 
-        let url = decoded_info.announce;
-        let mut reqwest_url = reqwest::Url::parse(&url).unwrap();
-        let info_hash = decoded_info.info.compute_hexsha1_binary();
+            reqwest_url
+                .query_pairs_mut()
+                .encoding_override(Some(&|x| {
+                    if x == "INFOHASH" {
+                        Cow::Owned(info_hash.clone())
+                    } else {
+                        Cow::Borrowed(x.as_bytes())
+                    }
+                }))
+                .append_pair("info_hash", "INFOHASH")
+                .append_pair("peer_id", PEER_ID)
+                .append_pair("port", "6881")
+                .append_pair("uploaded", "0")
+                .append_pair("downloaded", "0")
+                .append_pair("left", decoded_info.info.length.to_string().as_str())
+                .append_pair("compact", "1")
+                .finish();
 
-        reqwest_url
-            .query_pairs_mut()
-            .encoding_override(Some(&|x| {
-                if x == "INFOHASH" {
-                    Cow::Owned(info_hash.clone())
-                } else {
-                    Cow::Borrowed(x.as_bytes())
-                }
-            }))
-            .append_pair("info_hash", "INFOHASH")
-            .append_pair("peer_id", "12345678901234567890")
-            .append_pair("port", "6881")
-            .append_pair("uploaded", "0")
-            .append_pair("downloaded", "0")
-            .append_pair("left", decoded_info.info.length.to_string().as_str())
-            .append_pair("compact", "1")
-            .finish();
+            let resp = reqwest::get(reqwest_url).await;
+            let body = resp.unwrap().bytes().await.unwrap();
 
-        let resp = reqwest::get(reqwest_url).await;
-        let body = resp.unwrap().bytes().await.unwrap();
+            let traker_response: TrackerResponse = serde_bencode::from_bytes(&body).unwrap();
 
-        let traker_response: TrackerResponse = serde_bencode::from_bytes(&body).unwrap();
+            // dbg!(&traker_response);
+            let peers = traker_response.get_peers();
 
-        // dbg!(&traker_response);
-        let peers = traker_response.get_peers();
+            println!(
+                "{}",
+                peers
+                    .iter()
+                    .map(|peer| format!("{}:{}", peer.host, peer.port))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            );
+            Ok(())
+        }
+        Command::Handshake { torrent_file, peer } => {
+            let info_hash = compute_info_hash(torrent_file);
 
-        println!(
-            "{}",
-            peers
-                .iter()
-                .map(|peer| format!("{}:{}", peer.host, peer.port))
-                .collect::<Vec<String>>()
-                .join("\n")
-        )
-    } else {
-        println!("unknown command: {}", args[1])
+            let mut stream = TcpStream::connect(peer.as_tuple()).await?;
+
+            let mut buffer: Vec<u8> = Vec::with_capacity(68);
+            let mut response_buffer: Vec<u8> = Vec::with_capacity(68);
+
+            buffer.push(19);
+            buffer.extend_from_slice(b"BitTorrent protocol");
+            buffer.extend_from_slice(&[0; 8]);
+            buffer.extend_from_slice(info_hash.as_slice());
+            buffer.extend_from_slice(PEER_ID.as_bytes());
+
+            stream.write_all(&buffer).await?;
+
+            stream.read_buf(&mut response_buffer).await?;
+
+            println!(
+                "Peer ID: {}",
+                (&response_buffer[48..68]).encode_hex::<String>()
+            );
+            Ok(())
+        }
     }
 }
