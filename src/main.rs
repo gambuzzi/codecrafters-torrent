@@ -26,10 +26,25 @@ struct Args {
 #[derive(Debug, Subcommand)]
 #[clap(rename_all = "snake_case")]
 enum Command {
-    Decode { encoded_value: String },
-    Info { torrent_file: String },
-    Peers { torrent_file: String },
-    Handshake { torrent_file: String, peer: Peer },
+    Decode {
+        encoded_value: String,
+    },
+    Info {
+        torrent_file: String,
+    },
+    Peers {
+        torrent_file: String,
+    },
+    Handshake {
+        torrent_file: String,
+        peer: Peer,
+    },
+    DownloadPiece {
+        #[arg(short, long)]
+        output: String,
+        torrent_file: String,
+        piece_index: usize,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -154,10 +169,73 @@ fn decode_bencoded_metainfo(encoded_value: &[u8]) -> Metainfo {
     serde_bencode::from_bytes(encoded_value).unwrap()
 }
 
-fn compute_info_hash(torrent_file: String) -> Vec<u8> {
+pub fn compute_info_hash(torrent_file: String) -> Vec<u8> {
     let content = fs::read(torrent_file).expect("Cannot read the file.");
     let decoded_info = decode_bencoded_metainfo(&content);
     decoded_info.info.compute_hexsha1_binary()
+}
+
+fn read_torrent_file(torrent_file: String) -> Metainfo {
+    let content = fs::read(torrent_file).expect("Cannot read the file.");
+    let decoded_info = decode_bencoded_metainfo(&content);
+
+    decoded_info
+}
+
+async fn get_peers(meta_info: &Metainfo) -> Result<Vec<Peer>, anyhow::Error> {
+    let url = meta_info.announce.clone();
+    let mut reqwest_url = reqwest::Url::parse(&url)?;
+    let info_hash = meta_info.info.compute_hexsha1_binary();
+
+    reqwest_url
+        .query_pairs_mut()
+        .encoding_override(Some(&|x| {
+            if x == "INFOHASH" {
+                Cow::Owned(info_hash.clone())
+            } else {
+                Cow::Borrowed(x.as_bytes())
+            }
+        }))
+        .append_pair("info_hash", "INFOHASH")
+        .append_pair("peer_id", PEER_ID)
+        .append_pair("port", "6881")
+        .append_pair("uploaded", "0")
+        .append_pair("downloaded", "0")
+        .append_pair("left", meta_info.info.length.to_string().as_str())
+        .append_pair("compact", "1")
+        .finish();
+
+    let resp = reqwest::get(reqwest_url).await;
+    let body = resp.unwrap().bytes().await?;
+
+    let traker_response: TrackerResponse = serde_bencode::from_bytes(&body)?;
+
+    // dbg!(&traker_response);
+    Ok(traker_response.get_peers())
+}
+
+async fn handshake(
+    meta_info: &Metainfo,
+    peer: &Peer,
+) -> Result<(TcpStream, String), anyhow::Error> {
+    let info_hash = meta_info.info.compute_hexsha1_binary();
+
+    let mut stream = TcpStream::connect(peer.as_tuple()).await?;
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(68);
+    let mut response_buffer: Vec<u8> = Vec::with_capacity(68);
+
+    buffer.push(19);
+    buffer.extend_from_slice(b"BitTorrent protocol");
+    buffer.extend_from_slice(&[0; 8]);
+    buffer.extend_from_slice(info_hash.as_slice());
+    buffer.extend_from_slice(PEER_ID.as_bytes());
+
+    stream.write_all(&buffer).await?;
+
+    stream.read_buf(&mut response_buffer).await?;
+
+    Ok((stream, (&response_buffer[48..68]).encode_hex::<String>()))
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
@@ -171,8 +249,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Info { torrent_file } => {
-            let content = fs::read(torrent_file).expect("Cannot read the file.");
-            let decoded_info = decode_bencoded_metainfo(&content);
+            let decoded_info = read_torrent_file(torrent_file);
             // dbg!(&decoded_info);
             let url = decoded_info.announce;
             let length = decoded_info.info.length;
@@ -197,38 +274,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Peers { torrent_file } => {
-            let content = fs::read(torrent_file).expect("Cannot read the file.");
-            let decoded_info = decode_bencoded_metainfo(&content);
-
-            let url = decoded_info.announce;
-            let mut reqwest_url = reqwest::Url::parse(&url).unwrap();
-            let info_hash = decoded_info.info.compute_hexsha1_binary();
-
-            reqwest_url
-                .query_pairs_mut()
-                .encoding_override(Some(&|x| {
-                    if x == "INFOHASH" {
-                        Cow::Owned(info_hash.clone())
-                    } else {
-                        Cow::Borrowed(x.as_bytes())
-                    }
-                }))
-                .append_pair("info_hash", "INFOHASH")
-                .append_pair("peer_id", PEER_ID)
-                .append_pair("port", "6881")
-                .append_pair("uploaded", "0")
-                .append_pair("downloaded", "0")
-                .append_pair("left", decoded_info.info.length.to_string().as_str())
-                .append_pair("compact", "1")
-                .finish();
-
-            let resp = reqwest::get(reqwest_url).await;
-            let body = resp.unwrap().bytes().await.unwrap();
-
-            let traker_response: TrackerResponse = serde_bencode::from_bytes(&body).unwrap();
-
-            // dbg!(&traker_response);
-            let peers = traker_response.get_peers();
+            let peers = get_peers(&read_torrent_file(torrent_file)).await?;
 
             println!(
                 "{}",
@@ -241,27 +287,106 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Handshake { torrent_file, peer } => {
-            let info_hash = compute_info_hash(torrent_file);
+            let meta_info = read_torrent_file(torrent_file);
+            let (_, peer_id) = handshake(&meta_info, &peer).await?;
 
-            let mut stream = TcpStream::connect(peer.as_tuple()).await?;
+            println!("Peer ID: {}", peer_id);
+            Ok(())
+        }
+        Command::DownloadPiece {
+            output,
+            torrent_file,
+            piece_index,
+        } => {
+            let meta_info = read_torrent_file(torrent_file);
+            let peers = get_peers(&meta_info).await?;
 
-            let mut buffer: Vec<u8> = Vec::with_capacity(68);
-            let mut response_buffer: Vec<u8> = Vec::with_capacity(68);
+            let (mut stream, _) = handshake(&meta_info, peers.iter().next().unwrap()).await?;
+            let check_sha1s = meta_info.info.get_pieces();
+            let pieces_count = check_sha1s.len();
+            let current_piece_lenght = if piece_index < pieces_count - 1 {
+                meta_info.info.piece_length
+            } else {
+                meta_info.info.length % meta_info.info.piece_length
+            };
 
-            buffer.push(19);
-            buffer.extend_from_slice(b"BitTorrent protocol");
-            buffer.extend_from_slice(&[0; 8]);
-            buffer.extend_from_slice(info_hash.as_slice());
-            buffer.extend_from_slice(PEER_ID.as_bytes());
+            let mut piece_buffer: Vec<u8> = vec![0; current_piece_lenght];
+            // dbg!(&current_piece_lenght);
 
-            stream.write_all(&buffer).await?;
+            let size = stream.read_u32().await?;
+            let _payload_type = stream.read_u8().await?;
+            let mut bitfield: Vec<u8> = vec![0; (size - 1) as usize];
+            stream.read_exact(&mut bitfield).await?;
 
-            stream.read_buf(&mut response_buffer).await?;
+            // dbg!(size);
+            // dbg!(_payload_type);
+            // dbg!(bitfield);
 
-            println!(
-                "Peer ID: {}",
-                (&response_buffer[48..68]).encode_hex::<String>()
-            );
+            let interested = [0_u8, 0, 0, 1, 2];
+
+            stream.write_all(&interested).await?;
+            let _size = stream.read_u32().await?;
+            let _payload_type = stream.read_u8().await?;
+            // dbg!(_size);
+            // dbg!(_payload_type);
+
+            let mut check_sha1 = [0_u8; 20];
+
+            while check_sha1s[piece_index] != check_sha1 {
+                for begin in (0..current_piece_lenght).step_by(16384) {
+                    // dbg!(&begin);
+                    let mut request = [
+                        0_u8,
+                        0,
+                        0,
+                        13,
+                        6,
+                        0,
+                        0,
+                        0,
+                        piece_index as u8,
+                        (begin / 256 / 256 / 256) as u8,
+                        ((begin / 256 / 256) % 256) as u8,
+                        ((begin / 256) % 256) as u8,
+                        (begin % 256) as u8,
+                        0,
+                        0,
+                        64,
+                        0,
+                    ];
+
+                    if begin + 16384 > current_piece_lenght {
+                        request[15] = ((current_piece_lenght % 16384) / 256) as u8;
+                        request[16] = ((current_piece_lenght % 16384) % 256) as u8;
+                    }
+
+                    stream.write_all(&request).await?;
+                    // dbg!("req sent");
+
+                    let size = stream.read_u32().await?;
+                    let _payload_type = stream.read_u8().await?;
+                    // dbg!(size);
+                    // dbg!(_payload_type);
+
+                    let mut buffer: Vec<u8> = vec![0; (size - 9) as usize];
+
+                    let _index = stream.read_u32().await?;
+                    let begin = stream.read_u32().await?;
+                    stream.read_exact(&mut buffer).await?;
+                    for idx in 0..buffer.len() {
+                        piece_buffer[begin as usize + idx] = buffer[idx as usize];
+                    }
+                }
+                let mut hasher = Sha1::new();
+                hasher.update(&piece_buffer);
+                let tmp = hasher.finalize().as_slice().to_vec();
+                for i in 0..check_sha1.len() {
+                    check_sha1[i] = tmp[i];
+                }
+            }
+
+            fs::write(output, piece_buffer)?;
+
             Ok(())
         }
     }
