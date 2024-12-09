@@ -45,6 +45,11 @@ enum Command {
         torrent_file: String,
         piece_index: usize,
     },
+    Download {
+        #[arg(short, long)]
+        output: String,
+        torrent_file: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -238,6 +243,98 @@ async fn handshake(
     Ok((stream, (&response_buffer[48..68]).encode_hex::<String>()))
 }
 
+async fn download_piece(
+    meta_info: &Metainfo,
+    piece_index: usize,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let peers = get_peers(&meta_info).await?;
+    let check_sha1s = meta_info.info.get_pieces();
+    let pieces_count = check_sha1s.len();
+
+    let (mut stream, _) = handshake(&meta_info, peers.iter().next().unwrap()).await?;
+    let current_piece_lenght = if piece_index < pieces_count - 1 {
+        meta_info.info.piece_length
+    } else {
+        meta_info.info.length % meta_info.info.piece_length
+    };
+
+    let mut piece_buffer: Vec<u8> = vec![0; current_piece_lenght];
+    // dbg!(&current_piece_lenght);
+
+    let size = stream.read_u32().await?;
+    let _payload_type = stream.read_u8().await?;
+    let mut bitfield: Vec<u8> = vec![0; (size - 1) as usize];
+    stream.read_exact(&mut bitfield).await?;
+
+    // dbg!(size);
+    // dbg!(_payload_type);
+    // dbg!(bitfield);
+
+    let interested = [0_u8, 0, 0, 1, 2];
+
+    stream.write_all(&interested).await?;
+    let _size = stream.read_u32().await?;
+    let _payload_type = stream.read_u8().await?;
+    // dbg!(_size);
+    // dbg!(_payload_type);
+
+    let mut check_sha1 = [0_u8; 20];
+
+    while check_sha1s[piece_index] != check_sha1 {
+        for begin in (0..current_piece_lenght).step_by(16384) {
+            // dbg!(&begin);
+            let mut request = [
+                0_u8,
+                0,
+                0,
+                13,
+                6,
+                0,
+                0,
+                0,
+                piece_index as u8,
+                (begin / 256 / 256 / 256) as u8,
+                ((begin / 256 / 256) % 256) as u8,
+                ((begin / 256) % 256) as u8,
+                (begin % 256) as u8,
+                0,
+                0,
+                64,
+                0,
+            ];
+
+            if begin + 16384 > current_piece_lenght {
+                request[15] = ((current_piece_lenght % 16384) / 256) as u8;
+                request[16] = ((current_piece_lenght % 16384) % 256) as u8;
+            }
+
+            stream.write_all(&request).await?;
+            // dbg!("req sent");
+
+            let size = stream.read_u32().await?;
+            let _payload_type = stream.read_u8().await?;
+            // dbg!(size);
+            // dbg!(_payload_type);
+
+            let mut buffer: Vec<u8> = vec![0; (size - 9) as usize];
+
+            let _index = stream.read_u32().await?;
+            let begin = stream.read_u32().await?;
+            stream.read_exact(&mut buffer).await?;
+            for idx in 0..buffer.len() {
+                piece_buffer[begin as usize + idx] = buffer[idx as usize];
+            }
+        }
+        let mut hasher = Sha1::new();
+        hasher.update(&piece_buffer);
+        let tmp = hasher.finalize().as_slice().to_vec();
+        for i in 0..check_sha1.len() {
+            check_sha1[i] = tmp[i];
+        }
+    }
+
+    Ok(piece_buffer)
+}
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -299,94 +396,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             piece_index,
         } => {
             let meta_info = read_torrent_file(torrent_file);
-            let peers = get_peers(&meta_info).await?;
 
-            let (mut stream, _) = handshake(&meta_info, peers.iter().next().unwrap()).await?;
-            let check_sha1s = meta_info.info.get_pieces();
-            let pieces_count = check_sha1s.len();
-            let current_piece_lenght = if piece_index < pieces_count - 1 {
-                meta_info.info.piece_length
-            } else {
-                meta_info.info.length % meta_info.info.piece_length
-            };
-
-            let mut piece_buffer: Vec<u8> = vec![0; current_piece_lenght];
-            // dbg!(&current_piece_lenght);
-
-            let size = stream.read_u32().await?;
-            let _payload_type = stream.read_u8().await?;
-            let mut bitfield: Vec<u8> = vec![0; (size - 1) as usize];
-            stream.read_exact(&mut bitfield).await?;
-
-            // dbg!(size);
-            // dbg!(_payload_type);
-            // dbg!(bitfield);
-
-            let interested = [0_u8, 0, 0, 1, 2];
-
-            stream.write_all(&interested).await?;
-            let _size = stream.read_u32().await?;
-            let _payload_type = stream.read_u8().await?;
-            // dbg!(_size);
-            // dbg!(_payload_type);
-
-            let mut check_sha1 = [0_u8; 20];
-
-            while check_sha1s[piece_index] != check_sha1 {
-                for begin in (0..current_piece_lenght).step_by(16384) {
-                    // dbg!(&begin);
-                    let mut request = [
-                        0_u8,
-                        0,
-                        0,
-                        13,
-                        6,
-                        0,
-                        0,
-                        0,
-                        piece_index as u8,
-                        (begin / 256 / 256 / 256) as u8,
-                        ((begin / 256 / 256) % 256) as u8,
-                        ((begin / 256) % 256) as u8,
-                        (begin % 256) as u8,
-                        0,
-                        0,
-                        64,
-                        0,
-                    ];
-
-                    if begin + 16384 > current_piece_lenght {
-                        request[15] = ((current_piece_lenght % 16384) / 256) as u8;
-                        request[16] = ((current_piece_lenght % 16384) % 256) as u8;
-                    }
-
-                    stream.write_all(&request).await?;
-                    // dbg!("req sent");
-
-                    let size = stream.read_u32().await?;
-                    let _payload_type = stream.read_u8().await?;
-                    // dbg!(size);
-                    // dbg!(_payload_type);
-
-                    let mut buffer: Vec<u8> = vec![0; (size - 9) as usize];
-
-                    let _index = stream.read_u32().await?;
-                    let begin = stream.read_u32().await?;
-                    stream.read_exact(&mut buffer).await?;
-                    for idx in 0..buffer.len() {
-                        piece_buffer[begin as usize + idx] = buffer[idx as usize];
-                    }
-                }
-                let mut hasher = Sha1::new();
-                hasher.update(&piece_buffer);
-                let tmp = hasher.finalize().as_slice().to_vec();
-                for i in 0..check_sha1.len() {
-                    check_sha1[i] = tmp[i];
-                }
-            }
+            let piece_buffer = download_piece(&meta_info, piece_index).await?;
 
             fs::write(output, piece_buffer)?;
 
+            Ok(())
+        }
+        Command::Download {
+            output,
+            torrent_file,
+        } => {
+            let meta_info = read_torrent_file(torrent_file);
+            let pieces_count = meta_info.info.get_pieces().len();
+
+            let mut file_buffer: Vec<u8> = vec![0; meta_info.info.length];
+
+            let mut ptr = 0;
+            for piece_index in 0..pieces_count {
+                let piece = download_piece(&meta_info, piece_index).await?;
+                file_buffer[ptr..ptr + piece.len()].copy_from_slice(&piece);
+                ptr += piece.len();
+            }
+
+            fs::write(output, file_buffer)?;
             Ok(())
         }
     }
