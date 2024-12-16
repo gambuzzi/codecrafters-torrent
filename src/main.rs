@@ -1,3 +1,4 @@
+use async_channel::Receiver;
 use clap::{Parser, Subcommand};
 use hex::ToHex;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,17 @@ use serde_bencode;
 use serde_bencode::value::Value;
 
 const PEER_ID: &str = "12345678901234567890";
+
+struct Work {
+    piece_index: usize,
+    current_piece_lenght: usize,
+    sha: [u8; 20],
+}
+
+struct DataBack {
+    buffer: Vec<u8>,
+    piece_index: usize,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -52,7 +64,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TorrentInfo {
     length: usize,
     pub name: String,
@@ -134,7 +146,7 @@ impl TrackerResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Metainfo {
     announce: String,
     info: TorrentInfo,
@@ -243,21 +255,12 @@ async fn handshake(
     Ok((stream, (&response_buffer[48..68]).encode_hex::<String>()))
 }
 
-async fn download_piece(
-    meta_info: &Metainfo,
+async fn download_raw_piece(
     piece_index: usize,
+    current_piece_lenght: usize,
+    stream: &mut TcpStream,
+    piece_sha1: &[u8; 20],
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let peers = get_peers(&meta_info).await?;
-    let check_sha1s = meta_info.info.get_pieces();
-    let pieces_count = check_sha1s.len();
-
-    let (mut stream, _) = handshake(&meta_info, peers.iter().next().unwrap()).await?;
-    let current_piece_lenght = if piece_index < pieces_count - 1 {
-        meta_info.info.piece_length
-    } else {
-        meta_info.info.length % meta_info.info.piece_length
-    };
-
     let mut piece_buffer: Vec<u8> = vec![0; current_piece_lenght];
     // dbg!(&current_piece_lenght);
 
@@ -280,7 +283,7 @@ async fn download_piece(
 
     let mut check_sha1 = [0_u8; 20];
 
-    while check_sha1s[piece_index] != check_sha1 {
+    while *piece_sha1 != check_sha1 {
         for begin in (0..current_piece_lenght).step_by(16384) {
             // dbg!(&begin);
             let mut request = [
@@ -335,6 +338,33 @@ async fn download_piece(
 
     Ok(piece_buffer)
 }
+
+async fn download_piece(
+    meta_info: &Metainfo,
+    piece_index: usize,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let peers = get_peers(&meta_info).await?;
+    let check_sha1s = meta_info.info.get_pieces();
+    let pieces_count = check_sha1s.len();
+
+    let (mut stream, _) = handshake(&meta_info, peers.iter().next().unwrap()).await?;
+    let current_piece_lenght = if piece_index < pieces_count - 1 {
+        meta_info.info.piece_length
+    } else {
+        meta_info.info.length % meta_info.info.piece_length
+    };
+
+    let piece_buffer = download_raw_piece(
+        piece_index,
+        current_piece_lenght,
+        &mut stream,
+        &check_sha1s[piece_index],
+    )
+    .await?;
+
+    Ok(piece_buffer)
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -407,16 +437,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
             output,
             torrent_file,
         } => {
+            let (s, r) = async_channel::unbounded();
+            let (s_databack, r_databack) = async_channel::unbounded();
+
             let meta_info = read_torrent_file(torrent_file);
-            let pieces_count = meta_info.info.get_pieces().len();
+            let check_sha1s = meta_info.info.get_pieces();
+            let pieces_count = check_sha1s.len();
+
+            let peers = get_peers(&meta_info).await?;
+            let mut workers = vec![];
+            for peer in peers {
+                let local_r: Receiver<Work> = r.clone();
+                let local_meta_info = meta_info.clone();
+                let local_s_databack = s_databack.clone();
+                let handle = tokio::spawn(async move {
+                    let (mut stream, _) = handshake(&local_meta_info, &peer).await.unwrap();
+
+                    loop {
+                        match local_r.recv().await {
+                            Ok(work) => {
+                                let buffer = download_raw_piece(
+                                    work.piece_index,
+                                    work.current_piece_lenght,
+                                    &mut stream,
+                                    &work.sha,
+                                )
+                                .await
+                                .unwrap();
+                                local_s_databack
+                                    .send(DataBack {
+                                        buffer,
+                                        piece_index: work.piece_index,
+                                    })
+                                    .await
+                                    .unwrap();
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                workers.push(handle);
+            }
 
             let mut file_buffer: Vec<u8> = vec![0; meta_info.info.length];
 
-            let mut ptr = 0;
+            // let mut ptr = 0;
             for piece_index in 0..pieces_count {
-                let piece = download_piece(&meta_info, piece_index).await?;
-                file_buffer[ptr..ptr + piece.len()].copy_from_slice(&piece);
-                ptr += piece.len();
+                let current_piece_lenght = if piece_index < pieces_count - 1 {
+                    meta_info.info.piece_length
+                } else {
+                    meta_info.info.length % meta_info.info.piece_length
+                };
+                s.send(Work {
+                    piece_index,
+                    current_piece_lenght,
+                    sha: check_sha1s[piece_index],
+                })
+                .await?;
+                // let piece = download_piece(&meta_info, piece_index).await?;
+                // file_buffer[ptr..ptr + piece.len()].copy_from_slice(&piece);
+                // ptr += piece.len();
+            }
+
+            let mut pieces_done = 0;
+            while pieces_done < pieces_count {
+                match r_databack.recv().await {
+                    Ok(data) => {
+                        let ptr = data.piece_index * meta_info.info.piece_length;
+                        file_buffer[ptr..ptr + data.buffer.len()].copy_from_slice(&data.buffer);
+                        pieces_done += 1;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            r.close();
+
+            for handle in workers {
+                handle.await?
             }
 
             fs::write(output, file_buffer)?;
